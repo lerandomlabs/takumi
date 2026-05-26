@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::io::{Cursor, Error as IoError, ErrorKind};
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
+use image::codecs::avif::AvifDecoder;
 use image::{
   AnimationDecoder, DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageResult, RgbaImage,
   codecs::{gif::GifDecoder, jpeg::JpegDecoder, png::PngDecoder},
@@ -19,6 +21,10 @@ use crate::rendering::premultiplied_pixmap_from_rgba;
 
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 const JPEG_SIGNATURE: [u8; 3] = [0xFF, 0xD8, 0xFF];
+#[cfg(not(target_arch = "wasm32"))]
+const ISOBMFF_FILE_TYPE_BOX: &[u8; 4] = b"ftyp";
+#[cfg(not(target_arch = "wasm32"))]
+const AVIF_BRANDS: [&[u8; 4]; 2] = [b"avif", b"avis"];
 
 pub(crate) struct DecodedGifFrame {
   pub(crate) pixmap: Arc<Pixmap>,
@@ -40,6 +46,8 @@ pub(crate) fn decode_image(bytes: &[u8]) -> ImageResult<DecodedImage> {
     Some(DetectedImageFormat::Jpeg) => decode_jpeg(bytes).map(DecodedImage::Pixmap),
     Some(DetectedImageFormat::Gif) => decode_gif(bytes).map(DecodedImage::Gif),
     Some(DetectedImageFormat::WebP) => decode_webp(bytes).map(DecodedImage::Pixmap),
+    #[cfg(not(target_arch = "wasm32"))]
+    Some(DetectedImageFormat::Avif) => decode_avif(bytes).map(DecodedImage::Pixmap),
     None => Err(ImageError::Unsupported(
       UnsupportedError::from_format_and_kind(
         ImageFormatHint::Unknown,
@@ -66,6 +74,11 @@ fn detect_image_format(bytes: &[u8]) -> Option<DetectedImageFormat> {
     return Some(DetectedImageFormat::WebP);
   }
 
+  #[cfg(not(target_arch = "wasm32"))]
+  if is_avif(bytes) {
+    return Some(DetectedImageFormat::Avif);
+  }
+
   None
 }
 
@@ -75,6 +88,8 @@ enum DetectedImageFormat {
   Jpeg,
   Gif,
   WebP,
+  #[cfg(not(target_arch = "wasm32"))]
+  Avif,
 }
 
 fn decode_with_image_crate(decoder: impl ImageDecoder, format: ImageFormat) -> ImageResult<Pixmap> {
@@ -87,6 +102,11 @@ pub(crate) fn decode_png(bytes: &[u8]) -> ImageResult<Pixmap> {
 
 fn decode_jpeg(bytes: &[u8]) -> ImageResult<Pixmap> {
   decode_with_image_crate(JpegDecoder::new(Cursor::new(bytes))?, ImageFormat::Jpeg)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_avif(bytes: &[u8]) -> ImageResult<Pixmap> {
+  decode_with_image_crate(AvifDecoder::new(Cursor::new(bytes))?, ImageFormat::Avif)
 }
 
 fn decode_gif(bytes: &[u8]) -> ImageResult<DecodedGif> {
@@ -176,6 +196,21 @@ fn decode_webp(bytes: &[u8]) -> ImageResult<Pixmap> {
   RgbaImage::from_raw(width as u32, height as u32, image_data)
     .ok_or_else(invalid_buffer_error)
     .and_then(|image| rgba_to_pixmap(image, ImageFormat::WebP))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_avif(bytes: &[u8]) -> bool {
+  if bytes.len() < 12 || &bytes[4..8] != ISOBMFF_FILE_TYPE_BOX {
+    return false;
+  }
+
+  if AVIF_BRANDS.iter().any(|brand| &bytes[8..12] == *brand) {
+    return true;
+  }
+
+  bytes[16..]
+    .chunks_exact(4)
+    .any(|brand| AVIF_BRANDS.iter().any(|avif_brand| brand == *avif_brand))
 }
 
 fn rgba_to_pixmap(image: RgbaImage, format: ImageFormat) -> ImageResult<Pixmap> {

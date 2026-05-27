@@ -1,0 +1,154 @@
+name: Raster Build Core Packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [restore-avif-input-native]
+    paths:
+      - ".github/workflows/raster-build-core-packages.yml"
+      - "takumi/**"
+      - "takumi-napi-core/**"
+      - "takumi-helpers/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.package }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            package: core-linux-x64-gnu
+            npm_name: "@takumi-rs/core-linux-x64-gnu"
+            target: x86_64-unknown-linux-gnu
+            binary: core.linux-x64-gnu.node
+            build_extra: --use-napi-cross
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -y libdav1d-dev pkg-config patchelf
+          - os: macos-15
+            package: core-darwin-arm64
+            npm_name: "@takumi-rs/core-darwin-arm64"
+            target: aarch64-apple-darwin
+            binary: core.darwin-arm64.node
+            build_extra: ""
+            setup: |
+              brew install dav1d pkg-config
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@main
+        with:
+          bun-version: latest
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+          stage: build
+
+      - name: Install native AVIF dependencies
+        shell: bash
+        run: ${{ matrix.setup }}
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile --filter ./takumi-helpers --filter ./takumi-napi-core
+
+      - name: Build helpers
+        working-directory: takumi-helpers
+        run: bun run build
+
+      - name: Build native core
+        working-directory: takumi-napi-core
+        env:
+          # Prefer static libdav1d when the platform package provides it. Ubuntu's
+          # libdav1d-dev usually does; Homebrew currently ships a dylib only, so
+          # the macOS step packages the dylib beside the .node file instead.
+          SYSTEM_DEPS_DAV1D_LINK: static
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bun run build --target ${{ matrix.target }} ${{ matrix.build_extra }}
+          bun run build:js
+          test -f "${{ matrix.binary }}"
+
+      - name: Bundle dynamic dav1d when needed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd takumi-napi-core
+          mkdir -p ../raster-package/package
+          cp "${{ matrix.binary }}" ../raster-package/package/
+
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            if ldd "${{ matrix.binary }}" | grep -q 'libdav1d'; then
+              DAV1D_PATH=$(ldd "${{ matrix.binary }}" | awk '/libdav1d/ { print $3; exit }')
+              cp "$DAV1D_PATH" ../raster-package/package/
+              patchelf --set-rpath '$ORIGIN' ../raster-package/package/${{ matrix.binary }}
+              echo "extra_files=\"libdav1d.so*\"" >> "$GITHUB_ENV"
+            else
+              echo "extra_files=" >> "$GITHUB_ENV"
+            fi
+            ldd ../raster-package/package/${{ matrix.binary }} || true
+          else
+            DAV1D_PATH=$(otool -L "${{ matrix.binary }}" | awk '/libdav1d/ { print $1; exit }')
+            if [[ -n "$DAV1D_PATH" ]]; then
+              DAV1D_FILE=$(basename "$DAV1D_PATH")
+              cp "$DAV1D_PATH" ../raster-package/package/
+              install_name_tool -change "$DAV1D_PATH" "@loader_path/$DAV1D_FILE" ../raster-package/package/${{ matrix.binary }}
+              echo "extra_files=\"$DAV1D_FILE\"" >> "$GITHUB_ENV"
+            else
+              echo "extra_files=" >> "$GITHUB_ENV"
+            fi
+            otool -L ../raster-package/package/${{ matrix.binary }}
+          fi
+
+      - name: Pack npm tarball
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd raster-package/package
+          cat > package.json <<JSON
+          {
+            "name": "${{ matrix.npm_name }}",
+            "version": "1.5.1",
+            "description": "Native Node.js bindings for the Takumi Rust image rendering engine with Raster AVIF input decoding.",
+            "license": "(MIT OR Apache-2.0)",
+            "main": "${{ matrix.binary }}",
+            "files": ["${{ matrix.binary }}"${extra_files:+, $extra_files}],
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/lerandomlabs/takumi.git",
+              "directory": "takumi-napi-core"
+            },
+            "engines": {
+              "node": ">= 12.22.0 < 13 || >= 14.17.0 < 15 || >= 15.12.0 < 16 || >= 16.0.0"
+            }
+          }
+          JSON
+
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            node -e 'let p=require("./package.json"); p.os=["linux"]; p.cpu=["x64"]; require("fs").writeFileSync("package.json", JSON.stringify(p, null, 2)+"\n")'
+          else
+            node -e 'let p=require("./package.json"); p.os=["darwin"]; p.cpu=["arm64"]; require("fs").writeFileSync("package.json", JSON.stringify(p, null, 2)+"\n")'
+          fi
+
+          mkdir -p ../../dist-packages
+          npm pack --pack-destination ../../dist-packages
+          ls -lh ../../dist-packages
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.package }}-tgz
+          path: raster-package/dist-packages/*.tgz
+          if-no-files-found: error

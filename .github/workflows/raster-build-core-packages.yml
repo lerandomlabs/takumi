@@ -31,8 +31,55 @@ jobs:
             binary: core.linux-x64-gnu.node
             build_extra: --use-napi-cross
             setup: |
+              set -euxo pipefail
               sudo apt-get update
-              sudo apt-get install -y libdav1d-dev pkg-config patchelf
+              sudo apt-get install -y meson ninja-build nasm pkg-config patchelf
+
+              WORK_DIR="$RUNNER_TEMP/dav1d-build"
+              TOOLCHAIN_VERSION="1.0.3"
+              TOOLCHAIN_ROOT="$HOME/.napi-rs/cross-toolchain/$TOOLCHAIN_VERSION"
+              mkdir -p "$TOOLCHAIN_ROOT" "$WORK_DIR"
+              cd "$WORK_DIR"
+
+              npm pack @napi-rs/cross-toolchain-x64-target-x86_64@$TOOLCHAIN_VERSION
+              tar -xf napi-rs-cross-toolchain-x64-target-x86_64-$TOOLCHAIN_VERSION.tgz
+              tar -xf package/x86_64-unknown-linux-gnu.tar.xz -C "$TOOLCHAIN_ROOT"
+
+              git clone --depth 1 --branch 1.5.0 https://github.com/videolan/dav1d.git
+              cat > cross.txt <<EOF
+              [binaries]
+              c = '$TOOLCHAIN_ROOT/bin/x86_64-unknown-linux-gnu-gcc'
+              cpp = '$TOOLCHAIN_ROOT/bin/x86_64-unknown-linux-gnu-g++'
+              ar = '$TOOLCHAIN_ROOT/bin/x86_64-unknown-linux-gnu-ar'
+              strip = '$TOOLCHAIN_ROOT/bin/x86_64-unknown-linux-gnu-strip'
+
+              [host_machine]
+              system = 'linux'
+              cpu_family = 'x86_64'
+              cpu = 'x86_64'
+              endian = 'little'
+              EOF
+
+              DAV1D_PREFIX="$WORK_DIR/dav1d-prefix"
+              meson setup \
+                --cross-file cross.txt \
+                -Ddefault_library=static \
+                -Denable_tools=false \
+                -Denable_tests=false \
+                --prefix "$DAV1D_PREFIX" \
+                dav1d-build dav1d
+              ninja -C dav1d-build install
+              DAV1D_LIB_DIR=$(dirname "$(find "$DAV1D_PREFIX" -name libdav1d.a -print -quit)")
+              DAV1D_HEADER=$(find "$DAV1D_PREFIX" -name dav1d.h -print -quit)
+              DAV1D_INCLUDE_DIR=$(dirname "$(dirname "$DAV1D_HEADER")")
+              test -f "$DAV1D_LIB_DIR/libdav1d.a"
+              test -f "$DAV1D_INCLUDE_DIR/dav1d/dav1d.h"
+
+              echo "SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1" >> "$GITHUB_ENV"
+              echo "SYSTEM_DEPS_DAV1D_LIB=dav1d" >> "$GITHUB_ENV"
+              echo "SYSTEM_DEPS_DAV1D_LINK=static" >> "$GITHUB_ENV"
+              echo "SYSTEM_DEPS_DAV1D_SEARCH_NATIVE=$DAV1D_LIB_DIR" >> "$GITHUB_ENV"
+              echo "SYSTEM_DEPS_DAV1D_INCLUDE=$DAV1D_INCLUDE_DIR" >> "$GITHUB_ENV"
           - os: macos-15
             package: core-darwin-arm64
             npm_name: "@takumi-rs/core-darwin-arm64"
@@ -69,11 +116,6 @@ jobs:
 
       - name: Build native core
         working-directory: takumi-napi-core
-        env:
-          # Prefer static libdav1d when the platform package provides it. Ubuntu's
-          # libdav1d-dev usually does; Homebrew currently ships a dylib only, so
-          # the macOS step packages the dylib beside the .node file instead.
-          SYSTEM_DEPS_DAV1D_LINK: static
         shell: bash
         run: |
           set -euxo pipefail
@@ -150,5 +192,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.package }}-tgz
-          path: raster-package/dist-packages/*.tgz
+          path: dist-packages/*.tgz
           if-no-files-found: error
